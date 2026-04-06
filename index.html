@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Park Chicago - Meter Relocation Simulator</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f4f0; color: #1a1a18; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; }
+  .container { max-width: 680px; width: 100%; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+  .subtitle { font-size: 13px; color: #666; margin-bottom: 32px; line-height: 1.5; }
+  .cards { display: flex; gap: 16px; flex-wrap: wrap; }
+  .card { flex: 1; min-width: 260px; background: #fff; border: 1px solid #d1cfc9; border-radius: 8px; padding: 24px; text-decoration: none; color: inherit; transition: border-color .15s, box-shadow .15s; }
+  .card:hover { border-color: #888; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  .card-label { font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: #888; margin-bottom: 8px; }
+  .card-title { font-size: 16px; font-weight: 700; margin-bottom: 10px; }
+  .card-desc { font-size: 12px; color: #555; line-height: 1.6; }
+  .badge { display: inline-block; font-size: 10px; padding: 2px 7px; border-radius: 10px; margin-top: 14px; font-weight: 600; }
+  .badge-stable { background: #dcfce7; color: #166534; }
+  .badge-active { background: #dbeafe; color: #1e40af; }
+  .footer { margin-top: 40px; font-size: 11px; color: #999; text-align: center; line-height: 1.7; }
+  .footer a { color: #666; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Park Chicago - Meter Relocation Simulator</h1>
+  <p class="subtitle">
+    A tool for exploring how Chicago parking meters could be relocated away from
+    bike and pedestrian infrastructure to higher-revenue commercial areas,
+    subject to the CPM concession contract constraints.
+  </p>
+  <div class="cards">
+    <a class="card" href="meter_sim_v10.html">
+      <div class="card-label">Version 10</div>
+      <div class="card-title">Drag-and-drop simulator</div>
+      <div class="card-desc">
+        Manual relocation workflow. Select flagged terminals, propose destinations
+        from pre-computed proposals, and apply moves. Includes permit zone
+        utilization heatmap and business license demand scoring.
+      </div>
+      <span class="badge badge-stable">Stable</span>
+    </a>
+    <a class="card" href="meter_sim_v11.html">
+      <div class="card-label">Version 11</div>
+      <div class="card-title">Scenario simulator</div>
+      <div class="card-desc">
+        Slider-based scenario engine. Set relocation scope, rate increases,
+        and removal targets; apply the full scenario in one step. Before/After
+        map view with summary panel and contract constraint gauges.
+      </div>
+      <span class="badge badge-active">Active development</span>
+    </a>
+  </div>
+  <div class="footer">
+    Data: City of Chicago Open Data Portal &mdash; Parking Meters, Business Licenses,
+    Zoning Districts, Transportation Network, Parking Permit Zones<br>
+    <a href="https://github.com/nikhunder/Park-Chicago-Reimagining">Source on GitHub</a>
+  </div>
+</div>
+</body>
+</html>
