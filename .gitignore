@@ -1,0 +1,16 @@
+# Large data file excluded due to GitHub 100MB limit
+# Download from: https://data.cityofchicago.org/Community-Economic-Development/Business-Licenses/r5kz-chrr
+business_licenses_20260406.csv
+
+# Log and scratch files
+scraper.log
+response.txt
+Catchup.txt
+
+# Older simulator versions
+meter_sim_v6.html
+meter_sim_v7.html
+meter_sim_v8.html
+meter_sim_v9.html
+chicago_meters_map.html
+generate_proposals - Copy.py
