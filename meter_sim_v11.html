@@ -752,7 +752,9 @@ async async function applyScenario() {
   }
 
   // Step 2: Relocate flagged terminals based on scope + sliders
-  if (_bsbRoutesPromise) await _bsbRoutesPromise;  // ensure BSB grid ready
+  // Lazy-load BSB geometry on first applyScenario call (avoids blocking boot)
+  if (!_bsbRoutesPromise) _bsbRoutesPromise = loadBsbRoutes();
+  await _bsbRoutesPromise;
   for (let i = 0; i < RAW.length; i++) {
     const s = state[i];
     const tid = String(RAW[i][F.ID]);
@@ -2611,7 +2613,6 @@ loadData().then(async data => {
   document.getElementById('top-sub').textContent =
     `${RAW.length.toLocaleString()} terminals - ${RAW.reduce((s,r)=>s+r[F.SP],0).toLocaleString()} spaces - real contract math`;
   initState();
-  _bsbRoutesPromise = loadBsbRoutes();  // non-blocking: loads in background
   refresh();
   initAllTooltips();
   setTimeout(initWalkthrough, 0);  // defer until DOM fully parsed
