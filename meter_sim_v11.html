@@ -811,7 +811,8 @@ async function applyScenario() {
 }
 
 function initWalkthrough() {
-  document.getElementById('wt-bg').classList.add('open');
+  const bg = document.getElementById('wt-bg');
+  if (bg) bg.classList.add('open');
 }
 
 function wtNext(n) {
