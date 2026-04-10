@@ -322,6 +322,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         <button class="scope-btn active" data-scope="both" onclick="setScope(this)">Both</button>
         <button class="scope-btn" data-scope="bike" onclick="setScope(this)">Bike only</button>
         <button class="scope-btn" data-scope="ped" onclick="setScope(this)">Ped only</button>
+        <button class="scope-btn" data-scope="bsb" onclick="setScope(this)">BSB only</button>
       </div>
     </div>
 
@@ -762,7 +763,9 @@ async function applyScenario() {
     const isPed  = PED_IDS.has(tid);
     const isBsb  = bsbGrid ? nearBsb(RAW[i][F.LON], RAW[i][F.LAT]) : false;
     const inScope = ctrl.relocScope === 'both' ? (isBike || isPed || isBsb)
-                  : ctrl.relocScope === 'bike'  ? isBike : isPed;
+                  : ctrl.relocScope === 'bike'  ? isBike
+                  : ctrl.relocScope === 'ped'   ? isPed
+                  : ctrl.relocScope === 'bsb'   ? isBsb : false;
     if (!inScope) continue;
 
     const cands = proposals[tid];
@@ -1112,7 +1115,7 @@ function nearBsb(lon, lat) {
   return false;
 }
 
-function loadBikeRoutes() {
+async function loadBikeRoutes() {
   if (bikeRouteData) return bikeRouteData;
   const bin = atob(BIKE_ROUTES_B64);
   const bytes = new Uint8Array(bin.length);
