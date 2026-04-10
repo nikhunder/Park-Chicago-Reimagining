@@ -717,7 +717,7 @@ function pickCandidate(cands, ctrl) {
   return scored[0].c;
 }
 
-async async function applyScenario() {
+async function applyScenario() {
   const applyBtn = document.getElementById('sc-apply-btn');
   if (applyBtn) { applyBtn.disabled = true; applyBtn.textContent = 'Applying...'; }
 
@@ -1066,7 +1066,7 @@ async function toggleLayer(which) {
 
 
 // ─── BIKE ROUTE LAYER ───────────────────────────────────────────────────────
-async async function loadBsbRoutes() {
+async function loadBsbRoutes() {
   if (!BSB_ROUTES_B64) return;
   const bin = atob(BSB_ROUTES_B64);
   const bytes = new Uint8Array(bin.length);
