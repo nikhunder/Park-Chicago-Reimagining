@@ -7,6 +7,8 @@ Output: gzip+base64 JSON {terminalID: [lat, lon, addr]}
 import base64, gzip, json, csv, re, math, random
 from pathlib import Path
 from collections import Counter, defaultdict
+import shapefile
+from pyproj import Transformer
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 LATM   = 111000   # meters per degree latitude
@@ -27,6 +29,16 @@ NO_PARK_CLASSES = {'1', '5', '7', '9', '99', 'E', 'RIV', 'S'}
 RATE_TIERS = [0.50, 2.50, 4.75, 7.00, 14.00]
 # Midpoints between consecutive tiers — boundary for snapping
 _RATE_BREAKS = [1.50, 3.625, 5.875, 10.50]
+
+# Per-tier price elasticity of demand.
+# Lower tiers serve commuters/residents with few alternatives → inelastic.
+# Higher tiers serve discretionary parkers who can substitute or avoid → elastic.
+# These scale how aggressively each tier is pushed toward its rate cap.
+TIER_ELASTICITY = {0.50: 0.10, 2.50: 0.20, 4.75: 0.35, 7.00: 0.50, 14.00: 0.65}
+
+# Revenue target: slightly above SRSV ($386M) to leave a cushion.
+# Per-tier factors are solved to hit this while keeping active spaces near 30,500.
+TARGET_SYSTEM_REV = 405_000_000
 
 # Chicago address grid: ~1m per address number (100 addr units ≈ one ~100m block).
 # Used to convert address range half-span into a geographic offset when shifting the
@@ -83,17 +95,9 @@ NBHD = {
     'far_south':  {'avgRate': 2.50, 'baseDensity': 0.85},
 }
 
-# Better Streets for Buses corridors — matched by street_nam in transportation_20260316.geojson.
-# The old BUS_CORRIDOR_N approach used the centerline 'n' field as a grid coordinate, but
-# 'n' is actually an internal segment ID. All exclusions are now geometry-based (see loading section).
-BUS_STREET_NAMES = {
-    '35TH', '55TH', 'GARFIELD', '63RD', '79TH', '95TH',
-    'ASHLAND', 'CHICAGO', 'COTTAGE GROVE', 'FULLERTON', 'HALSTED',
-    'IRVING PARK', 'JEFFERY', 'MICHIGAN', 'LAKE SHORE',
-    'PULASKI', 'ROOSEVELT', 'WESTERN',
-    'COLUMBUS', 'MARINE', 'INDIANA',
-}
-BUS_EXCL_M = 30   # exclude destinations within 30m of a bus corridor centerline
+# Better Streets for Buses corridors — loaded from BetterStreets_BusRoutes.shp
+# (NAD83 Illinois State Plane East, US feet → WGS84 via pyproj).
+BUS_EXCL_M = 30   # exclude destinations within 30m of a BSB route centerline
 FREE_PARK_EXCL_M = 201   # 1/8 mile — exclude destinations within this radius of a free surface lot
 
 # Road types that are NOT parkable (expressways, ramps, rail, etc.)
@@ -582,32 +586,44 @@ def on_ped_street(lon, lat):
 
 # (LODES WAC job data removed — replaced by business license density scoring)
 
-# ── Load bus corridors from transportation geojson ────────────────────────────
-print("Loading bus corridors from transportation geojson...")
-with open('transportation_20260316.geojson') as f:
-    trans_gj = json.load(f)
-
-bus_segments = []   # list of (ax, ay, bx, by, bbox)
-for feat in trans_gj['features']:
-    if feat['properties'].get('street_nam', '') not in BUS_STREET_NAMES:
+# ── Load BSB corridors from BetterStreets_BusRoutes.shp ──────────────────────
+print("Loading Better Streets for Buses corridors from shapefile...")
+_bsb_transformer = Transformer.from_crs('ESRI:102671', 'EPSG:4326', always_xy=True)
+sf_bsb = shapefile.Reader('BetterStreets_BusRoutes.shp')
+bus_segments = []   # list of (ax, ay, bx, by, bbox)  [lon, lat order]
+buf = BUS_EXCL_M / min(LATM, LONM)
+for shp in sf_bsb.shapes():
+    if shp.shapeType == 0:
         continue
-    geom = feat.get('geometry')
-    if not geom:
-        continue
-    lines = geom['coordinates'] if geom['type'] == 'LineString' else (
-            geom['coordinates'] if geom['type'] == 'MultiLineString' else [])
-    if geom['type'] == 'LineString':
-        lines = [lines]
-    buf = BUS_EXCL_M / min(LATM, LONM)
-    for line in lines:
-        for i in range(len(line) - 1):
-            ax, ay = line[i][0], line[i][1]
-            bx, by = line[i+1][0], line[i+1][1]
+    parts = list(shp.parts) + [len(shp.points)]
+    for i in range(len(parts) - 1):
+        pts = shp.points[parts[i]:parts[i+1]]
+        wgs = []
+        for x, y in pts:
+            lon, lat = _bsb_transformer.transform(x, y)
+            if -88.5 < lon < -87.2 and 41.4 < lat < 42.5:
+                wgs.append((lon, lat))
+        for j in range(len(wgs) - 1):
+            ax, ay = wgs[j]
+            bx, by = wgs[j+1]
             bbox = (min(ax,bx)-buf, min(ay,by)-buf, max(ax,bx)+buf, max(ay,by)+buf)
             bus_segments.append((ax, ay, bx, by, bbox))
 
 bus_grid = build_grid([((ax,ay,bx,by), bbox) for ax,ay,bx,by,bbox in bus_segments], cell=0.001)
-print(f"  {len(bus_segments)} bus corridor line segments")
+print(f"  {len(bus_segments)} BSB route line segments")
+
+# Encode BSB geometry for client-side geometry check (replaces pre-computed BSB_IDS)
+_bsb_segs_data = [[round(ax,5), round(ay,5), round(bx,5), round(by,5)]
+                  for ax, ay, bx, by, _ in bus_segments]
+BSB_ROUTES_B64 = base64.b64encode(
+    gzip.compress(json.dumps(_bsb_segs_data, separators=(',', ':')).encode())
+).decode('ascii')
+print(f"  BSB B64: {len(_bsb_segs_data):,} segments -> {len(BSB_ROUTES_B64):,} chars")
+
+# ── Load transportation geojson for street name / road class lookups ──────────
+print("Loading transportation network...")
+with open('transportation_20260316.geojson') as f:
+    trans_gj = json.load(f)
 
 # ── Build street name and road class lookups from transportation features ──────
 # The centerline 'n' field = transportation 'streetname' field (internal numeric code).
@@ -722,6 +738,22 @@ def near_bus_corridor(lon, lat):
         if dist_point_to_segment(lon, lat, ax, ay, bx, by) < BUS_EXCL_M:
             return True
     return False
+
+# ── Compute BSB_IDS: existing meters on BSB corridors ────────────────────────
+# Mirrors how BIKE_IDS/PED_IDS work: flag source terminals for relocation.
+# near_bus_corridor() is now available, so we can check current meter positions.
+BSB_IDS = set()
+for _m in meters:
+    if near_bus_corridor(_m['lon'], _m['lat']):
+        BSB_IDS.add(_m['tid'])
+BSB_IDS -= FLAGGED_IDS   # don't double-count bike/ped terminals already flagged
+FLAGGED_IDS |= BSB_IDS
+# Re-split retained_meters: pull BSB terminals out and into flagged_meters
+_bsb_new = [_m for _m in retained_meters if _m['tid'] in BSB_IDS]
+retained_meters = [_m for _m in retained_meters if _m['tid'] not in BSB_IDS]
+flagged_meters  = flagged_meters + _bsb_new
+print(f"  BSB_IDS: {len(BSB_IDS)} terminals on BSB corridors flagged for relocation")
+print(f"  Total flagged: {len(flagged_meters)}, Retained: {len(retained_meters)}")
 
 # ── Load parking permit zones ─────────────────────────────────────────────────
 print("Loading parking permit zones...")
@@ -1706,6 +1738,26 @@ print(f"  Zone utilization: {len(zone_util_data)} zones encoded ({len(zone_util_
 # ═══════════════════════════════════════════════════════════════════════════════
 # POST-PROCESSING: Floor removal → least-productive removal → rate minimization
 # ═══════════════════════════════════════════════════════════════════════════════
+# ── Rate elasticity helpers (used in post-processing) ─────────────────────────
+def snap_to_tier(rate):
+    return min(RATE_TIERS, key=lambda t: abs(t - rate))
+
+_avg_inv_eps = sum(1.0 / e for e in TIER_ELASTICITY.values()) / len(TIER_ELASTICITY)
+
+def get_tier_factor(base_factor, tier):
+    """Return the tier-specific factor, scaled inversely by elasticity.
+    Inelastic tiers (low price) get pushed harder; elastic tiers get lighter touch."""
+    eps = TIER_ELASTICITY.get(tier, 0.35)
+    return min(1.0, base_factor * (1.0 / eps) / _avg_inv_eps)
+
+def elast_rev(base_rev, base_rate, new_rate, tier):
+    """Revenue adjusted for demand response: Rev ~ base_rev * (new_rate/base_rate)^(1-eps).
+    When eps=0 this reduces to simple linear scaling; higher eps adds demand penalty."""
+    if base_rate <= 0 or new_rate <= 0:
+        return base_rev
+    eps = TIER_ELASTICITY.get(tier, 0.35)
+    return base_rev * ((new_rate / base_rate) ** (1.0 - eps))
+
 print("\nPost-processing scenario removals and rate minimization...")
 
 # ── Constants (match meter_sim_v10.html) ──────────────────────────────────────
@@ -1737,11 +1789,11 @@ if raw_data:
     # Set of bike/ped TIDs without a proposal → already treated as removed
     bp_removed = {tid for tid in FLAGGED_IDS if tid not in output_proposals}
 
-    # ── Compute after-scenario revenue at MAX rate cap ─────────────────────────
-    # Retained meters: apply full rate cap (upper bound)
-    # Relocated bike/ped: use proposal rate
-    # Already-removed bike/ped: 0
+    # ── Compute after-scenario revenue at MAX rate cap (with elasticity) ─────────
+    # All active meters (retained and relocated) scale from their base to cap.
+    # Elasticity is applied so floor-removal threshold reflects real demand response.
     after_rev_max = {}
+    prop_base_rate = {}   # pRate for each relocated terminal (used in Step 3)
     for row in raw_data:
         tid = str(row[FI['ID']])
         sp  = row[FI['SP']]
@@ -1752,100 +1804,179 @@ if raw_data:
             prop  = output_proposals[tid]
             cand  = prop[0] if isinstance(prop[0], list) else prop
             prate = cand[3] if (len(cand) > 3 and cand[3] is not None) else row[FI['RATE']]
-            orig_rev = row[FI['REV']]
+            cap_rate = get_rate_cap(prate)
+            tier     = snap_to_tier(prate)
+            orig_rev  = row[FI['REV']]
             orig_rate = row[FI['RATE']]
-            after_rev_max[tid] = (orig_rev * prate / orig_rate) if orig_rate > 0 else orig_rev
+            base_rev  = (orig_rev * prate / orig_rate) if orig_rate > 0 else orig_rev
+            after_rev_max[tid] = elast_rev(base_rev, prate, cap_rate, tier)
+            prop_base_rate[tid] = prate
         else:
             orig_rate = row[FI['RATE']]
             cap_rate  = get_rate_cap(orig_rate)
+            tier      = snap_to_tier(orig_rate)
             orig_rev  = row[FI['REV']]
-            after_rev_max[tid] = (orig_rev * cap_rate / orig_rate) if orig_rate > 0 else orig_rev
+            after_rev_max[tid] = elast_rev(orig_rev, orig_rate, cap_rate, tier)
 
-    # ── STEP 1: Remove meters below $2K/space/year (at max-cap scenario) ──────
+    # ── JS demand model (mirrors calcUtil / NBHD in meter_sim_v10.html) ──────────
+    JS_NBHD_DENSITY = {
+        'loop': 1.10, 'south_loop': 1.03, 'near_west': 1.01,
+        'north_side': 0.97, 'far_north': 0.94, 'northwest': 0.91,
+        'west_side': 0.88, 'southwest': 0.87, 'far_south': 0.85,
+    }
+
+    def js_base_util(rate):
+        if rate >= 14:   return 0.55
+        if rate >= 7:    return 0.72
+        if rate >= 4.75: return 0.78
+        if rate >= 2.5:  return 0.65
+        return 0.50
+
+    def js_calc_util(rate, nbhd):
+        bu = js_base_util(rate)
+        nd = JS_NBHD_DENSITY.get(nbhd, 0.90)
+        return min(0.97, max(0.25, bu * nd * 1.05 * 1.02))
+
+    def js_annual_rev(row, applied_rate):
+        """JS-equivalent annual revenue: sp * rate * calcUtil(rate, nbhd) * hrs * days."""
+        nbhd = row[FI['NBHD']]
+        sp   = row[FI['SP']]
+        hrs  = row[FI['HRS']]
+        days = row[FI['DAYS']]
+        util = js_calc_util(applied_rate, nbhd)
+        return sp * applied_rate * util * hrs * days
+
+    def applied_rate_for(row, tid, base_f):
+        """Compute the rate applied to a terminal at a given base_factor."""
+        if tid in FLAGGED_IDS and tid in prop_base_rate:
+            prate    = prop_base_rate[tid]
+            cap_rate = get_rate_cap(prate)
+            tier     = snap_to_tier(prate)
+            return prate + (cap_rate - prate) * get_tier_factor(base_f, tier)
+        else:
+            orig_rate = row[FI['RATE']]
+            cap_rate  = get_rate_cap(orig_rate)
+            tier      = snap_to_tier(orig_rate)
+            return orig_rate + (cap_rate - orig_rate) * get_tier_factor(base_f, tier)
+
+    def system_rev_at(base_f, removed_set):
+        """JS-model system revenue at a given base_factor, excluding removed_set.
+        Uses calcUtil step function to match what the JS simulator displays."""
+        total = 0.0
+        for row in raw_data:
+            tid = str(row[FI['ID']])
+            if tid in removed_set:
+                continue
+            arate = applied_rate_for(row, tid, base_f)
+            total += js_annual_rev(row, arate)
+        return total
+
+    def solve_base_factor(removed_set, target_rev):
+        """Binary search for base_factor that achieves target_rev given removed_set."""
+        lo, hi = 0.0, 1.0
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            if system_rev_at(mid, removed_set) < target_rev:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
+    # ── STEP 0: Initial base_factor solve with only bp_removed ────────────────
+    print("  Step 0: Initial base_factor solve (JS model)...")
+    init_base_factor = solve_base_factor(bp_removed, TARGET_SYSTEM_REV)
+    print(f"    Initial base_factor: {init_base_factor:.4f}  "
+          f"(${system_rev_at(init_base_factor, bp_removed):,.0f})")
+
+    # ── STEP 1: Remove meters below $2K/space/yr using JS calcUtil at actual rates
+    # Compute applied rate for each active terminal at init_base_factor, then use
+    # JS demand model to estimate utilization → JS-equivalent revenue → floor check.
+    TARGET_SPACES = 30_500
+
     below_floor = set()
     for row in raw_data:
         tid = str(row[FI['ID']])
         if tid in bp_removed:
             continue
-        sp  = row[FI['SP']]
-        rev = after_rev_max.get(tid, 0.0)
-        if sp > 0 and (rev / sp) < 2000:
+        sp = row[FI['SP']]
+        if sp <= 0:
+            continue
+        arate = applied_rate_for(row, tid, init_base_factor)
+        js_rev = js_annual_rev(row, arate)
+        if (js_rev / sp) < 2000:
             below_floor.add(tid)
 
-    print(f"  Below $2K/space/yr floor: {len(below_floor)} terminals — marking removed")
+    print(f"  Step 1: Below $2K/space/yr floor: {len(below_floor)} terminals removed")
     for tid in below_floor:
-        after_rev_max[tid] = 0.0
         if tid in output_proposals:
             del output_proposals[tid]
 
-    # ── STEP 2: Remove 7665 least-productive remaining meters ─────────────────
-    all_removed_so_far = bp_removed | below_floor
-    ranked = []
-    for row in raw_data:
-        tid = str(row[FI['ID']])
-        if tid in all_removed_so_far:
-            continue
-        sp  = row[FI['SP']]
-        rev = after_rev_max.get(tid, 0.0)
-        ranked.append((rev / sp if sp > 0 else 0.0, tid))
+    # ── STEP 2: Trim to ~TARGET_SPACES active spaces by removing least-productive ─
+    after_step1 = bp_removed | below_floor
+    active_rows = [r for r in raw_data if str(r[FI['ID']]) not in after_step1]
+    total_active_spaces = sum(r[FI['SP']] for r in active_rows)
+    print(f"  Step 2: Active spaces after floor removal: {total_active_spaces:,}")
 
-    ranked.sort(key=lambda x: x[0])   # ascending: least productive first
-    N_REMOVE = 7665
-    least_productive = {tid for _, tid in ranked[:N_REMOVE]}
-    print(f"  Removing {len(least_productive)} least-productive remaining meters "
-          f"(rev/space threshold: ${ranked[N_REMOVE-1][0]:.0f}/sp/yr)")
+    least_productive = set()
+    if total_active_spaces > TARGET_SPACES:
+        # Score each active terminal by JS rev/space at init_base_factor
+        scored = []
+        for row in active_rows:
+            tid   = str(row[FI['ID']])
+            sp    = row[FI['SP']]
+            if sp <= 0:
+                continue
+            arate = applied_rate_for(row, tid, init_base_factor)
+            js_rev = js_annual_rev(row, arate)
+            scored.append((js_rev / sp, sp, tid))
+        scored.sort()   # ascending: remove least-productive first
 
-    for tid in least_productive:
-        after_rev_max[tid] = 0.0
-
-    # ── STEP 3: Find minimum rate factor to reach SRSV ────────────────────────
-    # New rate = orig_rate + (cap_rate − orig_rate) × factor  (factor ∈ [0, 1])
-    # For relocated bike/ped: rate is fixed by proposal, not affected by factor
-    all_removed = all_removed_so_far | least_productive
-
-    total_orig_rev  = 0.0    # revenue at original (no-increase) rates
-    total_potential = 0.0    # additional revenue from full rate cap increase
-
-    for row in raw_data:
-        tid = str(row[FI['ID']])
-        if tid in all_removed:
-            continue
-        if tid in FLAGGED_IDS:
-            # Relocated meter: rate fixed, not scaled by factor
-            total_orig_rev += after_rev_max.get(tid, 0.0)
-        else:
-            orig_rate = row[FI['RATE']]
-            cap_rate  = get_rate_cap(orig_rate)
-            orig_rev  = row[FI['REV']]
-            total_orig_rev  += orig_rev
-            if cap_rate > orig_rate and orig_rate > 0:
-                total_potential += orig_rev * ((cap_rate - orig_rate) / orig_rate)
-
-    if total_orig_rev >= SRSV:
-        rate_factor = 0.0
-        print(f"  Original revenue (${total_orig_rev:,.0f}) already meets SRSV — no rate increase needed")
-    elif total_potential <= 0:
-        rate_factor = 1.0
-        print(f"  WARNING: full rate cap still can't reach SRSV — using factor=1.0")
+        spaces_to_cut = total_active_spaces - TARGET_SPACES
+        cut_so_far = 0
+        for _, sp, tid in scored:
+            if cut_so_far >= spaces_to_cut:
+                break
+            least_productive.add(tid)
+            cut_so_far += sp
+            if tid in output_proposals:
+                del output_proposals[tid]
+        remaining = total_active_spaces - cut_so_far
+        print(f"    Removed {len(least_productive)} terminals ({cut_so_far:,} spaces) "
+              f"-> {remaining:,} active spaces")
     else:
-        rate_factor = min(1.0, (SRSV - total_orig_rev) / total_potential)
+        print(f"    Already at or below {TARGET_SPACES:,} spaces — no trimming needed")
 
-    proj_rev = total_orig_rev + rate_factor * total_potential
-    print(f"  Revenue at original rates (post-removal): ${total_orig_rev:,.0f}")
-    print(f"  Rate increase potential (full cap):        ${total_potential:,.0f}")
-    print(f"  Minimum rate factor:                       {rate_factor:.4f}")
-    print(f"  Projected revenue at min factor:           ${proj_rev:,.0f}")
+    # ── STEP 3: Re-solve per-tier rate factors targeting TARGET_SYSTEM_REV ───────
+    all_removed = after_step1 | least_productive
+    print(f"  Step 3: Re-solving base_factor with {len(all_removed)} total removed terminals...")
+    base_factor = solve_base_factor(all_removed, TARGET_SYSTEM_REV)
+    achieved_rev = system_rev_at(base_factor, all_removed)
+
+    per_tier_factors = {str(tier): round(get_tier_factor(base_factor, tier), 4)
+                        for tier in RATE_TIERS}
+
+    print(f"    Base factor: {base_factor:.4f}  |  Target: ${TARGET_SYSTEM_REV:,.0f}  |  "
+          f"Achieved: ${achieved_rev:,.0f}")
+    print(f"    Per-tier factors:")
+    for tier in RATE_TIERS:
+        tf  = per_tier_factors[str(tier)]
+        cap = get_rate_cap(tier)
+        new = round(tier + (cap - tier) * tf, 2)
+        print(f"      ${tier:.2f}/hr  ->  ${new:.2f}/hr  (factor {tf})")
+
+    rate_factor = round(base_factor, 4)  # kept for backward compat display
 
     # ── Restructure output to v2 format ───────────────────────────────────────
     output_proposals = {
         'v': 2,
         'proposals': output_proposals,
         'removed': sorted(below_floor | least_productive),
-        'rate_factor': round(rate_factor, 4),
+        'rate_factor': rate_factor,          # base factor (for backward compat)
+        'rate_factors': per_tier_factors,    # per-tier factors keyed by tier string
     }
     print(f"\n  V2 output: {len(output_proposals['proposals'])} relocations, "
           f"{len(output_proposals['removed'])} additional removals, "
-          f"rate_factor={output_proposals['rate_factor']}")
+          f"base_factor={rate_factor:.4f}")
 
 print(f"\nWriting proposals_b64.txt...")
 compressed = gzip.compress(json.dumps(output_proposals, separators=(',', ':')).encode('utf-8'))
@@ -1895,10 +2026,70 @@ if n3 == 0:
 else:
     print(f"  ZONE_UTIL_B64 updated ({len(zone_util_b64):,} chars).")
 
-if n > 0 or n2 > 0 or n3 > 0:
+# Embed BSB_ROUTES_B64 (geometry-based check replaces pre-computed BSB_IDS list)
+new_html, n4 = re.subn(
+    r'(const BSB_ROUTES_B64\s*=\s*`)([^`]*?)(`)',
+    lambda m: m.group(1) + BSB_ROUTES_B64 + m.group(3),
+    new_html, count=1, flags=re.DOTALL
+)
+if n4 == 0:
+    print("  WARNING: BSB_ROUTES_B64 constant not found in HTML — skipping embed.")
+else:
+    print(f"  BSB_ROUTES_B64 updated ({len(BSB_ROUTES_B64):,} chars).")
+
+if n > 0 or n2 > 0 or n3 > 0 or n4 > 0:
     with open(HTML_FILE, 'w', encoding='utf-8') as f:
         f.write(new_html)
     print(f"  {HTML_FILE} saved.")
+
+# ── Embed into meter_sim_v11.html ─────────────────────────────────────────────
+HTML_FILE_V11 = 'meter_sim_v11.html'
+print(f"\nEmbedding into {HTML_FILE_V11}...")
+with open(HTML_FILE_V11, 'r', encoding='utf-8', errors='replace') as f:
+    html11 = f.read()
+
+v11_n = 0
+
+# Embed PROPOSALS_B64
+html11, _n = re.subn(
+    r'(const PROPOSALS_B64\s*=\s*`)([^`]*?)(`)',
+    lambda m: m.group(1) + encoded + m.group(3),
+    html11, count=1, flags=re.DOTALL
+)
+v11_n += _n
+if _n == 0:
+    print("  WARNING: PROPOSALS_B64 not found in v11 — skipping.")
+else:
+    print(f"  PROPOSALS_B64 updated ({len(encoded):,} chars).")
+
+# Embed BSB_ROUTES_B64
+html11, _n = re.subn(
+    r'(const BSB_ROUTES_B64\s*=\s*`)([^`]*?)(`)',
+    lambda m: m.group(1) + BSB_ROUTES_B64 + m.group(3),
+    html11, count=1, flags=re.DOTALL
+)
+v11_n += _n
+if _n == 0:
+    print("  WARNING: BSB_ROUTES_B64 not found in v11 — skipping.")
+else:
+    print(f"  BSB_ROUTES_B64 updated ({len(BSB_ROUTES_B64):,} chars).")
+
+# Embed ZONE_UTIL_B64
+html11, _n = re.subn(
+    r'(const ZONE_UTIL_B64\s*=\s*`)([^`]*?)(`)',
+    lambda m: m.group(1) + zone_util_b64 + m.group(3),
+    html11, count=1, flags=re.DOTALL
+)
+v11_n += _n
+if _n == 0:
+    print("  WARNING: ZONE_UTIL_B64 not found in v11 — skipping.")
+else:
+    print(f"  ZONE_UTIL_B64 updated ({len(zone_util_b64):,} chars).")
+
+if v11_n > 0:
+    with open(HTML_FILE_V11, 'w', encoding='utf-8') as f:
+        f.write(html11)
+    print(f"  {HTML_FILE_V11} saved.")
 
 print("\nProposals generation complete.")
 
