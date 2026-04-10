@@ -1703,7 +1703,151 @@ zone_util_gz  = gzip.compress(json.dumps(zone_util_data, separators=(',', ':')).
 zone_util_b64 = base64.b64encode(zone_util_gz).decode('ascii')
 print(f"  Zone utilization: {len(zone_util_data)} zones encoded ({len(zone_util_b64):,} chars)")
 
-print(f"\nWriting proposals_b64.txt ({len(output_proposals)} proposals)...")
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-PROCESSING: Floor removal → least-productive removal → rate minimization
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\nPost-processing scenario removals and rate minimization...")
+
+# ── Constants (match meter_sim_v10.html) ──────────────────────────────────────
+SRSV        = 386_661_383   # Settlement System Revenue Value
+CPI_FACTOR  = 1.382         # matches HTML constant
+RATE_TIERS  = [0.50, 2.50, 4.75, 7.00, 14.00]
+
+def get_rate_cap(orig_rate):
+    """Mirror getRateCap() from the JS."""
+    tier = min(RATE_TIERS, key=lambda t: abs(t - orig_rate))
+    return (tier + 0.25) * CPI_FACTOR
+
+# ── Decode full meter data (with REV, HRS, DAYS, SP) from HTML B64 ─────────────
+# Fields: [id, addr, lat, lon, rate, sp, hrs, days, util, rev, nbhd, clz]
+FI = {'ID':0,'ADDR':1,'LAT':2,'LON':3,'RATE':4,'SP':5,'HRS':6,'DAYS':7,'UTIL':8,'REV':9,'NBHD':10,'CLZ':11}
+
+b64_m = re.search(r'const B64\s*=\s*`([^`]+)`', html)
+if not b64_m:
+    print("  WARNING: B64 constant not found — skipping post-processing")
+    raw_data = []
+else:
+    raw_data = json.loads(gzip.decompress(base64.b64decode(b64_m.group(1))).decode('utf-8'))
+    print(f"  Decoded {len(raw_data)} meters from HTML B64 data")
+
+if raw_data:
+    # Build lookup
+    raw_by_tid = {str(row[FI['ID']]): row for row in raw_data}
+
+    # Set of bike/ped TIDs without a proposal → already treated as removed
+    bp_removed = {tid for tid in FLAGGED_IDS if tid not in output_proposals}
+
+    # ── Compute after-scenario revenue at MAX rate cap ─────────────────────────
+    # Retained meters: apply full rate cap (upper bound)
+    # Relocated bike/ped: use proposal rate
+    # Already-removed bike/ped: 0
+    after_rev_max = {}
+    for row in raw_data:
+        tid = str(row[FI['ID']])
+        sp  = row[FI['SP']]
+        if tid in bp_removed:
+            after_rev_max[tid] = 0.0
+            continue
+        if tid in FLAGGED_IDS and tid in output_proposals:
+            prop  = output_proposals[tid]
+            cand  = prop[0] if isinstance(prop[0], list) else prop
+            prate = cand[3] if (len(cand) > 3 and cand[3] is not None) else row[FI['RATE']]
+            orig_rev = row[FI['REV']]
+            orig_rate = row[FI['RATE']]
+            after_rev_max[tid] = (orig_rev * prate / orig_rate) if orig_rate > 0 else orig_rev
+        else:
+            orig_rate = row[FI['RATE']]
+            cap_rate  = get_rate_cap(orig_rate)
+            orig_rev  = row[FI['REV']]
+            after_rev_max[tid] = (orig_rev * cap_rate / orig_rate) if orig_rate > 0 else orig_rev
+
+    # ── STEP 1: Remove meters below $2K/space/year (at max-cap scenario) ──────
+    below_floor = set()
+    for row in raw_data:
+        tid = str(row[FI['ID']])
+        if tid in bp_removed:
+            continue
+        sp  = row[FI['SP']]
+        rev = after_rev_max.get(tid, 0.0)
+        if sp > 0 and (rev / sp) < 2000:
+            below_floor.add(tid)
+
+    print(f"  Below $2K/space/yr floor: {len(below_floor)} terminals — marking removed")
+    for tid in below_floor:
+        after_rev_max[tid] = 0.0
+        if tid in output_proposals:
+            del output_proposals[tid]
+
+    # ── STEP 2: Remove 7665 least-productive remaining meters ─────────────────
+    all_removed_so_far = bp_removed | below_floor
+    ranked = []
+    for row in raw_data:
+        tid = str(row[FI['ID']])
+        if tid in all_removed_so_far:
+            continue
+        sp  = row[FI['SP']]
+        rev = after_rev_max.get(tid, 0.0)
+        ranked.append((rev / sp if sp > 0 else 0.0, tid))
+
+    ranked.sort(key=lambda x: x[0])   # ascending: least productive first
+    N_REMOVE = 7665
+    least_productive = {tid for _, tid in ranked[:N_REMOVE]}
+    print(f"  Removing {len(least_productive)} least-productive remaining meters "
+          f"(rev/space threshold: ${ranked[N_REMOVE-1][0]:.0f}/sp/yr)")
+
+    for tid in least_productive:
+        after_rev_max[tid] = 0.0
+
+    # ── STEP 3: Find minimum rate factor to reach SRSV ────────────────────────
+    # New rate = orig_rate + (cap_rate − orig_rate) × factor  (factor ∈ [0, 1])
+    # For relocated bike/ped: rate is fixed by proposal, not affected by factor
+    all_removed = all_removed_so_far | least_productive
+
+    total_orig_rev  = 0.0    # revenue at original (no-increase) rates
+    total_potential = 0.0    # additional revenue from full rate cap increase
+
+    for row in raw_data:
+        tid = str(row[FI['ID']])
+        if tid in all_removed:
+            continue
+        if tid in FLAGGED_IDS:
+            # Relocated meter: rate fixed, not scaled by factor
+            total_orig_rev += after_rev_max.get(tid, 0.0)
+        else:
+            orig_rate = row[FI['RATE']]
+            cap_rate  = get_rate_cap(orig_rate)
+            orig_rev  = row[FI['REV']]
+            total_orig_rev  += orig_rev
+            if cap_rate > orig_rate and orig_rate > 0:
+                total_potential += orig_rev * ((cap_rate - orig_rate) / orig_rate)
+
+    if total_orig_rev >= SRSV:
+        rate_factor = 0.0
+        print(f"  Original revenue (${total_orig_rev:,.0f}) already meets SRSV — no rate increase needed")
+    elif total_potential <= 0:
+        rate_factor = 1.0
+        print(f"  WARNING: full rate cap still can't reach SRSV — using factor=1.0")
+    else:
+        rate_factor = min(1.0, (SRSV - total_orig_rev) / total_potential)
+
+    proj_rev = total_orig_rev + rate_factor * total_potential
+    print(f"  Revenue at original rates (post-removal): ${total_orig_rev:,.0f}")
+    print(f"  Rate increase potential (full cap):        ${total_potential:,.0f}")
+    print(f"  Minimum rate factor:                       {rate_factor:.4f}")
+    print(f"  Projected revenue at min factor:           ${proj_rev:,.0f}")
+
+    # ── Restructure output to v2 format ───────────────────────────────────────
+    output_proposals = {
+        'v': 2,
+        'proposals': output_proposals,
+        'removed': sorted(below_floor | least_productive),
+        'rate_factor': round(rate_factor, 4),
+    }
+    print(f"\n  V2 output: {len(output_proposals['proposals'])} relocations, "
+          f"{len(output_proposals['removed'])} additional removals, "
+          f"rate_factor={output_proposals['rate_factor']}")
+
+print(f"\nWriting proposals_b64.txt...")
 compressed = gzip.compress(json.dumps(output_proposals, separators=(',', ':')).encode('utf-8'))
 encoded    = base64.b64encode(compressed).decode('ascii')
 with open('proposals_b64.txt', 'w') as f:
@@ -1711,7 +1855,7 @@ with open('proposals_b64.txt', 'w') as f:
 print(f"  Done. File size: {len(encoded):,} chars")
 
 # ── Embed into meter_sim_v10.html ─────────────────────────────────────────────
-HTML_FILE = 'meter_sim_v11.html'
+HTML_FILE = 'meter_sim_v10.html'
 print(f"\nEmbedding into {HTML_FILE}...")
 with open(HTML_FILE, 'r', encoding='utf-8', errors='replace') as f:
     html = f.read()
